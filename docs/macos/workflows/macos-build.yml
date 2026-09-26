@@ -1,0 +1,98 @@
+# Сборка macOS-версии Code Labs (Electron) на облачном macOS-раннере GitHub.
+# Запускается с Windows — Mac не нужен.
+#
+# Положить в репозиторий ИСХОДНИКОВ: .github/workflows/macos-build.yml
+#
+# Без подписи (sign = false): собирается .dmg, который запускается только через
+# правый клик -> «Открыть», и автообновление НЕ работает. Годится, чтобы проверить сборку.
+#
+# С подписью (sign = true) нужны секреты:
+#   MAC_CSC_LINK          — сертификат «Developer ID Application» в .p12, в base64
+#   MAC_CSC_KEY_PASSWORD  — пароль этого .p12
+#   ASC_KEY_P8            — содержимое AuthKey_XXXXXXXX.p8 (тот же ключ, что для iOS)
+#   ASC_KEY_ID            — Key ID
+#   ASC_ISSUER_ID         — Issuer ID
+#   APPLE_TEAM_ID         — Team ID
+
+name: macOS build (Electron)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: 'Подписать и нотаризовать (нужен Developer ID)'
+        type: boolean
+        default: false
+      publish:
+        description: 'Выложить в GitHub Releases (для автообновления)'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Установить зависимости
+        run: npm ci
+
+      - name: Подготовить ключ нотаризации
+        if: ${{ inputs.sign }}
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p ~/private_keys
+          printf '%s\n' "$ASC_KEY_P8" > "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Собрать (без подписи)
+        if: ${{ !inputs.sign }}
+        env:
+          # Не искать сертификаты в связке ключей — иначе electron-builder падает.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --mac --publish never
+
+      - name: Собрать (с подписью и нотаризацией)
+        if: ${{ inputs.sign }}
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ github.workspace }}/../private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+          APPLE_API_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # electron-builder ждёт путь к .p8; берём реальный из HOME.
+          export APPLE_API_KEY="$HOME/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            npx electron-builder --mac --publish always
+          else
+            npx electron-builder --mac --publish never
+          fi
+
+      - name: Что собралось
+        if: always()
+        run: ls -la dist release 2>/dev/null || true
+
+      - name: Сохранить сборку как артефакт
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeLabs-macos
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: warn
