@@ -1,0 +1,68 @@
+# Разовый запуск: создаёт папку ios/ (Xcode-проект Capacitor) и коммитит её в репозиторий.
+# Запускается вручную: вкладка Actions -> "iOS bootstrap" -> Run workflow.
+# Нужен ОДИН раз. Дальше пользуйтесь ios-testflight.yml.
+#
+# Положить в репозиторий ИСХОДНИКОВ Code Labs: .github/workflows/ios-bootstrap.yml
+
+name: iOS bootstrap (создать папку ios/)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Установить зависимости
+        run: npm ci
+
+      - name: Добавить @capacitor/ios той же версии, что @capacitor/core
+        run: |
+          CORE_VERSION="$(node -p "require('@capacitor/core/package.json').version")"
+          echo "Capacitor core: $CORE_VERSION"
+          npm install --save "@capacitor/ios@${CORE_VERSION}"
+
+      - name: Собрать веб-часть
+        run: npm run build
+
+      - name: Создать iOS-проект
+        run: |
+          npx cap add ios
+          npx cap sync ios
+
+      - name: Прописать iOS-ключи в Info.plist
+        run: |
+          PLIST=ios/App/App/Info.plist
+          # Локальные уведомления на iOS запрашивают разрешение в рантайме,
+          # но ITSAppUsesNonExemptEncryption убирает вопрос про экспорт шифрования
+          # при каждой загрузке в TestFlight.
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST" || \
+          /usr/libexec/PlistBuddy -c "Set :ITSAppUsesNonExemptEncryption false" "$PLIST"
+          # Чтобы заметки/экспорты были видны в приложении «Файлы» на iPhone.
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" || \
+          /usr/libexec/PlistBuddy -c "Set :UIFileSharingEnabled true" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" || \
+          /usr/libexec/PlistBuddy -c "Set :LSSupportsOpeningDocumentsInPlace true" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print" "$PLIST"
+
+      - name: Закоммитить ios/
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ios package.json package-lock.json
+          if git diff --cached --quiet; then
+            echo "Нечего коммитить — папка ios/ уже в репозитории."
+          else
+            git commit -m "chore(ios): добавить iOS-платформу Capacitor"
+            git push
+          fi

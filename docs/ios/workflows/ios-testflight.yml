@@ -1,0 +1,136 @@
+# Собирает iOS-версию Code Labs на облачном macOS-раннере GitHub
+# и отправляет её в TestFlight. Mac не нужен — всё запускается с Windows.
+#
+# Положить в репозиторий ИСХОДНИКОВ Code Labs: .github/workflows/ios-testflight.yml
+#
+# Требуемые секреты репозитория (Settings -> Secrets and variables -> Actions):
+#   ASC_KEY_ID     — Key ID ключа App Store Connect API
+#   ASC_ISSUER_ID  — Issuer ID оттуда же
+#   ASC_KEY_P8     — всё содержимое файла AuthKey_XXXXXXXX.p8 (вместе со строками BEGIN/END)
+#   APPLE_TEAM_ID  — Team ID (10 символов) из developer.apple.com -> Membership
+
+name: iOS -> TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: 'Версия для показа (например 1.6.2). Пусто = взять из package.json'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Установить зависимости
+        run: npm ci
+
+      - name: Собрать веб-часть и синхронизировать с iOS
+        run: |
+          npm run build
+          npx cap sync ios
+
+      - name: Определить номер версии и сборки
+        id: ver
+        run: |
+          MV="${{ github.event.inputs.marketing_version }}"
+          if [ -z "$MV" ]; then
+            MV="$(node -p "require('./package.json').version")"
+          fi
+          echo "marketing=$MV"            >> "$GITHUB_OUTPUT"
+          # Номер сборки должен быть уникальным для каждой загрузки в TestFlight.
+          echo "build=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "Версия $MV, сборка ${{ github.run_number }}"
+
+      - name: Положить ключ App Store Connect API
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p ~/private_keys
+          printf '%s\n' "$ASC_KEY_P8" > "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Архивировать (xcodebuild archive)
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          xcodebuild archive \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}" \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
+            MARKETING_VERSION="${{ steps.ver.outputs.marketing }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}"
+
+      - name: Сформировать ExportOptions.plist
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>teamID</key>
+            <string>${{ secrets.APPLE_TEAM_ID }}</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>destination</key>
+            <string>export</string>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Экспортировать .ipa
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}"
+          ls -la "$RUNNER_TEMP/export"
+
+      - name: Проверить и загрузить в TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          IPA="$(ls "$RUNNER_TEMP"/export/*.ipa | head -1)"
+          echo "Загружаю $IPA"
+          xcrun altool --validate-app -f "$IPA" -t ios \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          xcrun altool --upload-app  -f "$IPA" -t ios \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Сохранить .ipa как артефакт сборки
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeLabs-ios-${{ steps.ver.outputs.marketing }}-${{ steps.ver.outputs.build }}
+          path: ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: warn
