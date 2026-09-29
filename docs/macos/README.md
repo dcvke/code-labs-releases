@@ -114,8 +114,9 @@ app.on('will-finish-launching', () => {
 
 ## 4. Мелочи, которые стоит поправить
 
-- **Нет обработчика `window-all-closed`.** По умолчанию Electron завершает приложение при
-  закрытии последнего окна на всех платформах. На macOS принято оставаться в Dock:
+- **`window-all-closed` завершает приложение безусловно.** В `main.cjs`:
+  `app.on("window-all-closed", () => { ...close(); app.quit(); })` — без проверки на darwin,
+  и обработчика `activate` нет. На macOS принято оставаться в Dock:
   ```js
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
